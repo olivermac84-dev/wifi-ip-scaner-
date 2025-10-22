@@ -1,0 +1,519 @@
+/*
+  esp32_cctv_scanner.ino (updated)
+  ESP32-C3 Super Mini - LAN CCTV scanner with BLE control and persistent WiFi credentials.
+
+  Changes in this update:
+  - Always send each JSON message in a single BLE notification (prevents chunking issues
+    that can cause IP and port digits to run together).
+  - Include full IP address available area / usable host range in scan_start JSON.
+    This reports network, broadcast, first usable, last usable, total usable hosts,
+    and an ip_range string (e.g. "192.168.1.1-192.168.1.254").
+  - Add combined ip_port field in device JSON (helps if client mangles fields).
+  - Add IPRANGE command to return the computed range without starting a scan.
+  - Fix minor macro typo for NUS TX UUID.
+*/
+
+#include <WiFi.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+
+#define DEFAULT_WIFI_SSID    ""      // leave blank to require BLE-set
+#define DEFAULT_WIFI_PASS    ""
+
+// NUS (Nordic UART Service) UUIDs
+#define NUS_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_CHAR_RX_UUID        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_CHAR_TX_UUID        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+NimBLECharacteristic* pTxCharacteristic = nullptr;
+NimBLECharacteristic* pRxCharacteristic = nullptr;
+bool bleClientConnected = false;
+
+Preferences prefs;
+
+// control
+String wifiSSID = DEFAULT_WIFI_SSID;
+String wifiPass = DEFAULT_WIFI_PASS;
+volatile bool doScan = false;
+volatile bool stopScan = false;
+
+const int connectTimeoutMsDefault = 200; // default per-port connect timeout (ms)
+int connectTimeoutMs = connectTimeoutMsDefault;
+const uint16_t scanPorts[] = {80, 8080, 8000, 5000, 88, 554, 37777};
+const size_t scanPortsCount = sizeof(scanPorts) / sizeof(scanPorts[0]);
+
+// Helper: send text via BLE as a single notification to avoid chunking/concatenation problems
+void bleSendLine(const String &s) {
+  if (!pTxCharacteristic) return;
+  // send the whole message in one notify call
+  pTxCharacteristic->setValue((uint8_t*)s.c_str(), s.length());
+  pTxCharacteristic->notify();
+  delay(8); // short pause to ensure notify goes out
+}
+
+// convenience: send JSON msg
+void sendJsonMsg(const String &k, const String &v) {
+  String j = String("{\"type\":\"msg\",\"") + k + "\":\"" + v + "\"}";
+  bleSendLine(j);
+}
+
+void sendStatusJson() {
+  String conn = (WiFi.status() == WL_CONNECTED) ? "connected" : "disconnected";
+  String ip = WiFi.localIP().toString();
+  String scanning = doScan ? "true" : "false";
+  String j = String("{\"type\":\"status\",\"wifi\":\"") + conn + "\",\"ip\":\"" + ip + "\",\"scanning\":" + scanning + "}";
+  bleSendLine(j);
+}
+
+// Helpers to convert IP <-> uint32
+uint32_t ipToU32(const IPAddress &ip) {
+  uint32_t x = 0;
+  for (int i = 0; i < 4; i++) {
+    x = (x << 8) | ip[i];
+  }
+  return x;
+}
+IPAddress u32ToIP(uint32_t v) {
+  uint8_t b[4];
+  for (int i = 3; i >= 0; i--) {
+    b[i] = v & 0xFF;
+    v >>= 8;
+  }
+  return IPAddress(b[0], b[1], b[2], b[3]);
+}
+
+// Compute and return network range info as JSON fields (assumes WiFi connected)
+void sendIpRangeInfo() {
+  if (WiFi.status() != WL_CONNECTED) {
+    bleSendLine("{\"type\":\"iprange\",\"error\":\"WiFi not connected\"}");
+    return;
+  }
+
+  IPAddress localIP = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  uint32_t ip32 = ipToU32(localIP);
+  uint32_t mask32 = ipToU32(mask);
+  uint32_t network = ip32 & mask32;
+  uint32_t hostBitsMask = (~mask32);
+  // broadcast address
+  uint32_t broadcast = network | hostBitsMask;
+
+  // determine usable host range (if hostBitsMask >= 2)
+  uint32_t firstHost = (hostBitsMask >= 2) ? (network + 1) : network;
+  uint32_t lastHost  = (hostBitsMask >= 2) ? (broadcast - 1) : broadcast;
+  uint32_t totalUsable = 0;
+  if (broadcast > network) {
+    // total addresses minus network & broadcast
+    if (broadcast - network >= 3) totalUsable = (broadcast - network - 1);
+    else if (broadcast - network == 2) totalUsable = 1;
+    else totalUsable = 0;
+  }
+
+  IPAddress netIP = u32ToIP(network);
+  IPAddress bcastIP = u32ToIP(broadcast);
+  IPAddress firstIP = u32ToIP(firstHost);
+  IPAddress lastIP = u32ToIP(lastHost);
+
+  String ipRange = String(firstIP.toString()) + "-" + lastIP.toString();
+
+  String j = String("{\"type\":\"iprange\",\"network\":\"") + netIP.toString()
+             + "\",\"broadcast\":\"" + bcastIP.toString()
+             + "\",\"first\":\"" + firstIP.toString()
+             + "\",\"last\":\"" + lastIP.toString()
+             + "\",\"hosts\":" + String(totalUsable)
+             + ",\"ip_range\":\"" + ipRange + "\"}";
+  bleSendLine(j);
+}
+
+// BLE callbacks
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer) {
+    bleClientConnected = true;
+    Serial.println("BLE: client connected");
+    sendJsonMsg("text", "BLE client connected");
+  }
+  void onDisconnect(NimBLEServer* pServer) {
+    bleClientConnected = false;
+    Serial.println("BLE: client disconnected");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pChar) {
+    std::string rx = pChar->getValue();
+    if (rx.length() == 0) return;
+    String s = String(rx.c_str());
+    s.trim();
+    Serial.println("BLE RX: " + s);
+
+    // HELP
+    if (s == "HELP") {
+      bleSendLine("{\"type\":\"help\",\"cmds\":\"WIFI:SSID,PASS | GETWIFI | IPRANGE | SCAN | STOP | STATUS | HELP\"}");
+      return;
+    }
+
+    // GETWIFI
+    if (s == "GETWIFI") {
+      String ss = prefs.getString("ssid", "");
+      String j = String("{\"type\":\"wifi_info\",\"ssid\":\"") + ss + "\",\"connected\":\"" + ((WiFi.status() == WL_CONNECTED) ? "true" : "false") + "\"}";
+      bleSendLine(j);
+      return;
+    }
+
+    // STATUS
+    if (s == "STATUS") {
+      sendStatusJson();
+      return;
+    }
+
+    // IPRANGE - return the computed available area / usable hosts
+    if (s == "IPRANGE") {
+      sendIpRangeInfo();
+      return;
+    }
+
+    // STOP scanning
+    if (s == "STOP") {
+      stopScan = true;
+      doScan = false;
+      bleSendLine("{\"type\":\"scan_stopped\"}");
+      return;
+    }
+
+    // SCAN command
+    if (s == "SCAN") {
+      if (WiFi.status() != WL_CONNECTED) {
+        bleSendLine("{\"type\":\"msg\",\"text\":\"WiFi not connected. Set WIFI credentials first.\"}");
+      } else {
+        stopScan = false;
+        doScan = true;
+        bleSendLine("{\"type\":\"msg\",\"text\":\"Scan scheduled\"}");
+      }
+      return;
+    }
+
+    // WIFI:SSID,PASS  (PASS may contain commas; we split on first comma after prefix)
+    if (s.startsWith("WIFI:")) {
+      String payload = s.substring(5);
+      // find first comma
+      int c = payload.indexOf(',');
+      String ss = "";
+      String pw = "";
+      if (c >= 0) {
+        ss = payload.substring(0, c);
+        pw = payload.substring(c + 1);
+      } else {
+        ss = payload;
+        pw = "";
+      }
+      ss.trim();
+      pw.trim();
+      // save
+      prefs.putString("ssid", ss);
+      prefs.putString("pass", pw);
+      wifiSSID = ss;
+      wifiPass = pw;
+      String j = String("{\"type\":\"wifi_saved\",\"ssid\":\"") + ss + "\"}";
+      bleSendLine(j);
+
+      // attempt connect
+      if (wifiSSID.length() > 0) {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_STA);
+        bleSendLine("{\"type\":\"msg\",\"text\":\"Attempting WiFi connect\"}");
+        WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+        int tries = 0;
+        while (WiFi.status() != WL_CONNECTED && tries < 20) {
+          delay(500);
+          tries++;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+          String ok = String("{\"type\":\"msg\",\"text\":\"WiFi connected\",\"ip\":\"") + WiFi.localIP().toString() + "\"}";
+          bleSendLine(ok);
+        } else {
+          bleSendLine("{\"type\":\"msg\",\"text\":\"WiFi connect failed\"}");
+        }
+      } else {
+        bleSendLine("{\"type\":\"msg\",\"text\":\"Empty SSID saved (no connect attempt).\"}");
+      }
+      return;
+    }
+
+    // Unknown
+    bleSendLine(String("{\"type\":\"msg\",\"text\":\"unknown command: ") + s + "\"}");
+  }
+};
+
+void setupBLE() {
+  NimBLEDevice::init("ESP32-C3-CamScanner");
+  NimBLEDevice::setSecurityAuth(false, false, false);
+  NimBLEServer* pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
+
+  pRxCharacteristic = pService->createCharacteristic(
+    NUS_CHAR_RX_UUID,
+    NIMBLE_PROPERTY::WRITE
+  );
+  pRxCharacteristic->setCallbacks(new RxCallbacks());
+
+  pTxCharacteristic = pService->createCharacteristic(
+    NUS_CHAR_TX_UUID,
+    NIMBLE_PROPERTY::NOTIFY
+  );
+  pTxCharacteristic->addDescriptor(new NimBLE2902());
+
+  pService->start();
+
+  NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  pAdv->addServiceUUID(NUS_SERVICE_UUID);
+  pAdv->setScanResponse(true);
+  pAdv->start();
+  Serial.println("BLE advertising started");
+}
+
+// simple WiFi connect at startup if credentials exist in prefs
+void connectWiFiStartup() {
+  String ss = prefs.getString("ssid", "");
+  String pw = prefs.getString("pass", "");
+  if (ss.length() == 0) {
+    Serial.println("No saved WiFi credentials.");
+    return;
+  }
+  wifiSSID = ss;
+  wifiPass = pw;
+  Serial.printf("Connecting to saved WiFi SSID: %s\n", wifiSSID.c_str());
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    // optionally auto-start scan
+    // doScan = true;
+  } else {
+    Serial.println("WiFi connection failed (waiting for BLE credentials)");
+  }
+}
+
+// Probe an HTTP-like port: send GET / and read first response headers
+String probeHTTP(const IPAddress &ip, uint16_t port) {
+  WiFiClient client;
+  client.setTimeout((connectTimeoutMs / 1000) + 1);
+  if (!client.connect(ip, port, connectTimeoutMs)) return "";
+  String req = "GET / HTTP/1.0\r\nHost: " + ip.toString() + "\r\nConnection: close\r\n\r\n";
+  client.print(req);
+  String response = "";
+  unsigned long start = millis();
+  while (millis() - start < connectTimeoutMs && client.available()) {
+    String line = client.readStringUntil('\n');
+    response += line;
+    response += "\n";
+    if (line.length() <= 1) break;
+    if (response.length() > 512) break;
+  }
+  client.stop();
+  return response;
+}
+
+// Probe RTSP port with OPTIONS
+String probeRTSP(const IPAddress &ip, uint16_t port) {
+  WiFiClient client;
+  client.setTimeout((connectTimeoutMs / 1000) + 1);
+  if (!client.connect(ip, port, connectTimeoutMs)) return "";
+  String req = "OPTIONS rtsp://" + ip.toString() + "/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: ESP32-C3-Scanner\r\n\r\n";
+  client.print(req);
+  String response = "";
+  unsigned long start = millis();
+  while (millis() - start < connectTimeoutMs && client.available()) {
+    String line = client.readStringUntil('\n');
+    response += line;
+    response += "\n";
+    if (response.length() > 512) break;
+  }
+  client.stop();
+  return response;
+}
+
+// Send device JSON result (includes ip_port combined field)
+void sendDeviceJson(const IPAddress &ip, uint16_t port, const String &service, const String &banner) {
+  // ensure banner is one-line and escape quotes roughly
+  String b = banner;
+  b.replace("\r", " ");
+  b.replace("\n", " ");
+  b.replace("\"", "'");
+  String ipStr = ip.toString();
+  String ipPort = ipStr + ":" + String(port);
+  String j = String("{\"type\":\"device\",\"ip\":\"") + ipStr + "\",\"port\":" + String(port)
+             + ",\"ip_port\":\"" + ipPort + "\",\"service\":\"" + service + "\",\"banner\":\"" + b + "\"}";
+  bleSendLine(j);
+}
+
+// Main scan routine: uses subnet mask to compute range and reports range info
+void scanNetworkOnce() {
+  if (WiFi.status() != WL_CONNECTED) {
+    bleSendLine("{\"type\":\"msg\",\"text\":\"WiFi not connected, cannot scan\"}");
+    return;
+  }
+
+  IPAddress localIP = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  uint32_t ip32 = ipToU32(localIP);
+  uint32_t mask32 = ipToU32(mask);
+  uint32_t network = ip32 & mask32;
+  uint32_t hostBitsMask = (~mask32);
+  uint32_t broadcast = network | hostBitsMask;
+
+  // compute usable host range
+  uint32_t firstHost = (hostBitsMask >= 2) ? (network + 1) : network;
+  uint32_t lastHost  = (hostBitsMask >= 2) ? (broadcast - 1) : broadcast;
+  uint32_t totalUsable = 0;
+  if (broadcast > network) {
+    if (broadcast - network >= 3) totalUsable = (broadcast - network - 1);
+    else if (broadcast - network == 2) totalUsable = 1;
+    else totalUsable = 0;
+  }
+
+  IPAddress netIP = u32ToIP(network);
+  IPAddress bcastIP = u32ToIP(broadcast);
+  IPAddress firstIP = u32ToIP(firstHost);
+  IPAddress lastIP = u32ToIP(lastHost);
+  String ipRange = String(firstIP.toString()) + "-" + lastIP.toString();
+
+  String startJson = String("{\"type\":\"scan_start\",\"ip\":\"") + localIP.toString()
+                     + "\",\"mask\":\"" + mask.toString()
+                     + "\",\"network\":\"" + netIP.toString()
+                     + "\",\"broadcast\":\"" + bcastIP.toString()
+                     + "\",\"first\":\"" + firstIP.toString()
+                     + "\",\"last\":\"" + lastIP.toString()
+                     + "\",\"hosts\":" + String(totalUsable)
+                     + ",\"ip_range\":\"" + ipRange + "\"}";
+  bleSendLine(startJson);
+
+  // determine scan bounds (clamp to 1..254 if range too big)
+  uint32_t startHost = firstHost;
+  uint32_t endHost = lastHost;
+
+  // Protect against extremely large scans on weird masks by limiting to RFC1918 reasonable bounds
+  // If hosts > 4096, fall back to scanning only first..last of the /24 derived from local IP
+  uint32_t hostsCount = (endHost >= startHost) ? (endHost - startHost + 1) : 0;
+  if (hostsCount == 0) {
+    bleSendLine("{\"type\":\"msg\",\"text\":\"No usable hosts in subnet\"}");
+    bleSendLine("{\"type\":\"scan_done\"}");
+    return;
+  }
+  if (hostsCount > 4096) {
+    // fallback: use /24 range of local IP
+    uint32_t localNetwork24 = (ip32 & 0xFFFFFF00);
+    startHost = localNetwork24 + 1;
+    endHost = localNetwork24 + 254;
+    hostsCount = 254;
+    String warn = String("{\"type\":\"msg\",\"text\":\"Large subnet detected, falling back to /24 scan: ") + u32ToIP(localNetwork24).toString() + "/24\"}";
+    bleSendLine(warn);
+  }
+
+  uint32_t scanned = 0;
+  uint32_t total = hostsCount;
+
+  for (uint32_t candidate = startHost; candidate <= endHost; candidate++) {
+    if (stopScan) {
+      bleSendLine("{\"type\":\"scan_stopped_by_user\"}");
+      stopScan = false;
+      return;
+    }
+
+    if (candidate == ip32) {
+      scanned++;
+      if ((scanned % 10) == 0) {
+        String p = String("{\"type\":\"progress\",\"scanned\":") + String(scanned) + ",\"total\":" + String(total) + "}";
+        bleSendLine(p);
+      }
+      continue; // skip own IP
+    }
+
+    IPAddress addr = u32ToIP(candidate);
+    scanned++;
+
+    if ((scanned % 10) == 0) {
+      String p = String("{\"type\":\"progress\",\"scanned\":") + String(scanned) + ",\"total\":" + String(total) + "}";
+      bleSendLine(p);
+    }
+
+    // try ports
+    for (size_t p = 0; p < scanPortsCount; p++) {
+      uint16_t port = scanPorts[p];
+      WiFiClient c;
+      c.setTimeout((connectTimeoutMs / 1000) + 1);
+      if (!c.connect(addr, port, connectTimeoutMs)) {
+        continue;
+      }
+      c.stop(); // connected; perform a more specific probe to get banner
+      String banner = "";
+      String svc = "UNKNOWN";
+      if (port == 554) {
+        banner = probeRTSP(addr, port);
+        svc = "RTSP";
+      } else {
+        banner = probeHTTP(addr, port);
+        svc = "HTTP";
+      }
+      if (banner.length() == 0) {
+        // still report open port even if no banner
+        sendDeviceJson(addr, port, svc, "");
+      } else {
+        // try to pick a small representative banner line or server header
+        String firstLine = banner.substring(0, banner.indexOf('\n'));
+        firstLine.trim();
+        String serverHeader = "";
+        int idx = banner.indexOf("Server:");
+        if (idx >= 0) {
+          int eol = banner.indexOf('\n', idx);
+          if (eol > idx) serverHeader = banner.substring(idx + 7, eol);
+        }
+        String chosen = (firstLine.length() > 0) ? firstLine : serverHeader;
+        if (chosen.length() == 0) chosen = banner;
+        sendDeviceJson(addr, port, svc, chosen);
+      }
+      // small delay between probing ports
+      delay(10);
+    }
+    // tiny pause
+    delay(3);
+  }
+
+  bleSendLine("{\"type\":\"scan_done\"}");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("ESP32-C3 CCTV Scanner (updated) starting...");
+
+  // init prefs
+  prefs.begin("cctv", false);
+
+  // BLE first (so you can connect and send creds)
+  setupBLE();
+
+  // try to connect using saved credentials
+  connectWiFiStartup();
+}
+
+void loop() {
+  // run scan if flagged and WiFi is connected
+  if (doScan && WiFi.status() == WL_CONNECTED) {
+    doScan = false;
+    scanNetworkOnce();
+  }
+  // idle
+  delay(200);
+}
